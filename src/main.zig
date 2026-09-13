@@ -2,8 +2,8 @@ const std = @import("std");
 const Environ = std.process.Environ;
 const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
-const ipc = @import("ipc.zig");
-const log = @import("log.zig");
+pub const ipc = @import("ipc.zig");
+pub const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
@@ -11,7 +11,7 @@ const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
-const Cfg = @import("cfg.zig");
+pub const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
@@ -1022,10 +1022,10 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     std.process.exit(agg_exit_code);
 }
 
-fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
+/// Writes the session list to an abstract writer. Used by the `list` CLI
+/// command (stdout) and by library consumers (buffer) via libs/mux.
+pub fn listInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool, w: *std.Io.Writer) !void {
     const current_session = socket.getSeshNameFromEnv();
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
     var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
     defer {
         for (sessions.items) |session| {
@@ -1046,15 +1046,15 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
 
     for (sessions.items) |session| {
-        if (session.is_error) {
-            try util.writeSessionLine(&stdout.interface, session, short, current_session);
-            try stdout.interface.flush();
-            continue;
-        }
-
-        try util.writeSessionLine(&stdout.interface, session, short, current_session);
-        try stdout.interface.flush();
+        try util.writeSessionLine(w, session, short, current_session);
+        try w.flush();
     }
+}
+
+fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try listInto(alloc, io, cfg, short, &stdout.interface);
 }
 
 fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
