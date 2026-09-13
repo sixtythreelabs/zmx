@@ -1,13 +1,13 @@
 const std = @import("std");
 const Environ = std.process.Environ;
-const build_options = @import("build_options");
+pub const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
 pub const ipc = @import("ipc.zig");
 pub const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
-const cross = @import("cross.zig");
-const socket = @import("socket.zig");
+pub const cross = @import("cross.zig");
+pub const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
         if (kvs.items.len == 0) {
             return printError(io, "at least one key=value pair required", .{});
         }
-        return labelSet(gpa, io, &cfg, sesh, kvs.items);
+        return labelSetCli(gpa, io, &cfg, sesh, kvs.items);
     } else if (std.mem.eql(u8, cmd, "clear") or std.mem.eql(u8, cmd, "cl")) {
         const sesh_name = args.next() orelse {
             return printError(io, "session name required (or run inside a zmx session)", .{});
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         if (detectHelp(sesh_name)) return help(io);
         const sesh = try socket.resolveSessionOrEnv(gpa, io, sesh_name);
         defer gpa.free(sesh);
-        return labelClear(gpa, io, &cfg, sesh);
+        return labelClearCli(gpa, io, &cfg, sesh);
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse {
             return printError(io, "completions requires a shell argument (bash, zsh, fish, nu)", .{});
@@ -124,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
         };
         return printCompletions(io, shell);
     } else if (std.mem.eql(u8, cmd, "detach") or std.mem.eql(u8, cmd, "d")) {
-        return detachAll(gpa, io, &cfg);
+        return detachAllCli(gpa, io, &cfg);
     } else if (std.mem.eql(u8, cmd, "history") or std.mem.eql(u8, cmd, "hi")) {
         var session_name: ?[]const u8 = null;
         var format: util.HistoryFormat = .plain;
@@ -279,6 +279,10 @@ pub fn main(init: std.process.Init) !void {
         var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+
         var matchers: std.ArrayList(socket.SessionMatch) = .empty;
         defer {
             for (matchers.items) |m| {
@@ -313,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
         for (sessions.items) |session| {
             for (matchers.items) |m| {
                 if (!m.matches(session.name)) continue;
-                kill(gpa, io, &cfg, session.name, force) catch |err| {
+                killCli(gpa, io, &cfg, session.name, force, stdout) catch |err| {
                     if (err == error.SessionNotFound and force) {
                         killed_any = true;
                         continue;
@@ -328,7 +332,7 @@ pub fn main(init: std.process.Init) !void {
         if (!killed_any) {
             for (matchers.items) |m| {
                 if (m.is_prefix) continue;
-                kill(gpa, io, &cfg, m.name, force) catch |err| {
+                killCli(gpa, io, &cfg, m.name, force, stdout) catch |err| {
                     if (err == error.SessionNotFound and force) {
                         killed_any = true;
                         continue;
@@ -668,14 +672,21 @@ fn help(io: std.Io) !void {
     try w.interface.flush();
 }
 
-fn printVersion(io: std.Io, cfg: *Cfg) !void {
-    var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
-    try w.interface.print(
+/// Builds the version banner into an abstract writer. Used by the
+/// `version` CLI command (stdout) and by library consumers (buffer) via
+/// libs/mux.
+pub fn versionInto(cfg: *Cfg, w: *std.Io.Writer) !void {
+    try w.print(
         "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
         .{ version, ghostty_version, cfg.socket_dir, cfg.log_dir },
     );
-    try w.interface.flush();
+    try w.flush();
+}
+
+fn printVersion(io: std.Io, cfg: *Cfg) !void {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try versionInto(cfg, &w.interface);
 }
 
 fn printCompletions(io: std.Io, shell: completions.Shell) !void {
@@ -1057,10 +1068,17 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     try listInto(alloc, io, cfg, short, &stdout.interface);
 }
 
-fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
+/// Detaches all clients of the session from ZMX_SESSION. Diagnostics are
+/// written to process stderr, then the error is returned -- no exiting.
+/// Used by the `detach` CLI command and by library consumers via libs/mux.
+pub fn detachAllInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
     const session_name = socket.getSeshNameFromEnv();
     if (session_name.len == 0) {
-        return printError(io, "not inside a zmx session (ZMX_SESSION not set)", .{});
+        var ebuf: [4096]u8 = undefined;
+        var ew = std.Io.File.stderr().writer(io, &ebuf);
+        ew.interface.print("error: not inside a zmx session (ZMX_SESSION not set)\n", .{}) catch {};
+        ew.interface.flush() catch {};
+        return error.NoCurrentSession;
     }
     std.log.info("detach all session={s}", .{session_name});
 
@@ -1068,7 +1086,10 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
     defer dir.close(io);
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.reportSessionNameTooLong(io, session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
@@ -1084,10 +1105,25 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
     };
 }
 
-fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, force: bool) !void {
+fn detachAllCli(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
+    // Diagnosed errors were already written to stderr by detachAllInto;
+    // exiting here preserves the CLI's previous exit code.
+    detachAllInto(alloc, io, cfg) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => std.process.exit(1),
+    };
+}
+
+/// Kills a session, writing the confirmation line to an abstract writer.
+/// Used by the `kill` CLI command (stdout) and by library consumers
+/// (buffer) via libs/mux.
+pub fn killInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, force: bool, w: *std.Io.Writer) !void {
     std.log.info("kill session={s}", .{session_name});
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.reportSessionNameTooLong(io, session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
@@ -1130,13 +1166,17 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
         if (n == 0) break;
     }
 
-    var buf: [100]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
-    try w.interface.print("killed session {s}\n", .{session_name});
-    try w.interface.flush();
+    try w.print("killed session {s}\n", .{session_name});
+    try w.flush();
 }
 
-fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
+fn killCli(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, force: bool, w: *std.Io.Writer) !void {
+    return killInto(alloc, io, cfg, session_name, force, w);
+}
+
+/// Writes the label-IPC diagnostic to stderr without exiting. Library
+/// consumers use this via labelGetInto; the CLI wrapper adds the exit.
+fn reportLabelError(io: std.Io, session_name: []const u8, err: anyerror) void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
     switch (err) {
@@ -1154,45 +1194,80 @@ fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn
         ) catch {},
     }
     w.interface.flush() catch {};
+}
+
+fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
+    reportLabelError(io, session_name, err);
     std.process.exit(1);
 }
 
-fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8) !void {
+/// Writes the label data for a session into an abstract writer.
+/// Used by the `get` CLI command (stdout) and by library consumers
+/// (buffer) via libs/mux.
+///
+/// Diagnostics (roundTrip failures, missing label key) are written to
+/// process stderr, then the error is returned -- no exiting, so callers
+/// in a host process survive.
+pub fn labelGetInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8, w: *std.Io.Writer) !void {
     std.log.info("label get session={s}", .{session_name});
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.reportSessionNameTooLong(io, session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
 
     const payload = ipc.roundTripForTag(alloc, socket_path, .LabelGet, "", .LabelData) catch |err| {
-        printLabelError(io, session_name, err);
+        reportLabelError(io, session_name, err);
+        return err;
     };
     defer alloc.free(payload);
 
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
     if (single_kv.len == 0) {
-        try stdout.interface.print("{s}", .{payload});
-        try stdout.interface.flush();
+        try w.print("{s}", .{payload});
+        try w.flush();
         return;
     }
 
     const val = label.getLabelValueFromPairs(single_kv, payload) catch |err| switch (err) {
-        error.LabelKeyNotFound => return printError(io, "label key \"{s}\" not found in session \"{s}\"", .{ single_kv, session_name }),
+        error.LabelKeyNotFound => {
+            var ebuf: [4096]u8 = undefined;
+            var ew = std.Io.File.stderr().writer(io, &ebuf);
+            ew.interface.print(
+                "error: label key \"{s}\" not found in session \"{s}\"\n",
+                .{ single_kv, session_name },
+            ) catch {};
+            ew.interface.flush() catch {};
+            return error.LabelKeyNotFound;
+        },
     };
-    try stdout.interface.print("{s}", .{val});
-    try stdout.interface.flush();
+    try w.print("{s}", .{val});
+    try w.flush();
 }
 
-/// Rejects a malformed label set before the caller acts on it. Exits rather
-/// than returning, so `attach --labels` can check its labels before a session
-/// exists to be left behind.
-fn assertLabels(io: std.Io, labels: []const u8) void {
+fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    // Diagnosed errors were already written to stderr by labelGetInto;
+    // exiting here preserves the CLI's previous exit code.
+    labelGetInto(alloc, io, cfg, session_name, single_kv, &stdout.interface) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => std.process.exit(1),
+    };
+}
+
+/// Validates a label set, writing diagnostics for invalid entries to stderr.
+/// Returns true when all entries are valid. Library consumers use this via
+/// labelSetInto; the CLI wrapper adds the exit.
+fn validateLabels(io: std.Io, labels: []const u8) bool {
+    var valid = true;
     var kvs = label.LabelIterator.init(labels);
     while (kvs.next()) |kv| {
         label.assertLabel(kv.key, kv.value) catch |err| {
+            valid = false;
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writer(io, &buf);
             const msg = "error: key-value kvs can only contain [a-z, A-Z, 0-9, -_.] characters";
@@ -1211,9 +1286,16 @@ fn assertLabels(io: std.Io, labels: []const u8) void {
                 },
             }
             w.interface.flush() catch {};
-            std.process.exit(1);
         };
     }
+    return valid;
+}
+
+/// Rejects a malformed label set before the caller acts on it. Exits rather
+/// than returning, so `attach --labels` can check its labels before a session
+/// exists to be left behind.
+fn assertLabels(io: std.Io, labels: []const u8) void {
+    if (!validateLabels(io, labels)) std.process.exit(1);
 }
 
 fn getTrackedEnvStr(
@@ -1278,7 +1360,9 @@ fn getEnvValue(key: []const u8, payload: []const u8) error{EnvVarNotFound}![]con
     return error.EnvVarNotFound;
 }
 
-fn printEnvError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
+/// Writes the env-IPC diagnostic to stderr without exiting. Library
+/// consumers use this via envGetInto.
+fn reportEnvError(io: std.Io, session_name: []const u8, err: anyerror) void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
     switch (err) {
@@ -1291,31 +1375,39 @@ fn printEnvError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
         ) catch {},
     }
     w.interface.flush() catch {};
-    std.process.exit(1);
 }
 
-fn envGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8, shell_mode: bool) !void {
+/// Writes the tracked environment variables for a session into an abstract
+/// writer. Used by the `print-env` CLI command (stdout) and by library
+/// consumers (buffer) via libs/mux.
+///
+/// Diagnostics are written to process stderr, then the error is returned
+/// -- no exiting, so callers in a host process survive.
+pub fn envGetInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8, shell_mode: bool, w: *std.Io.Writer) !void {
     std.log.info("env get session={s}", .{session_name});
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.reportSessionNameTooLong(io, session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
 
     const payload = ipc.roundTripForTag(alloc, socket_path, .EnvGet, "", .EnvData) catch |err| {
-        printEnvError(io, session_name, err);
+        reportEnvError(io, session_name, err);
+        return err;
     };
     defer alloc.free(payload);
 
-    var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
     if (single_kv.len > 0) {
         const val = getEnvValue(single_kv, payload) catch |err| {
-            printEnvError(io, session_name, err);
+            reportEnvError(io, session_name, err);
+            return err;
         };
-        try stdout.interface.print("{s}\n", .{val});
-        try stdout.interface.flush();
+        try w.print("{s}\n", .{val});
+        try w.flush();
         return;
     }
 
@@ -1325,62 +1417,105 @@ fn envGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const
         var it = EnvIterator.init(payload);
         while (it.next()) |entry| {
             if (entry.value) |val| {
-                try stdout.interface.print("export {s}='", .{entry.key});
+                try w.print("export {s}='", .{entry.key});
                 for (val) |c| {
                     if (c == '\'') {
-                        try stdout.interface.print("'\\''", .{});
+                        try w.print("'\\''", .{});
                     } else {
-                        try stdout.interface.print("{c}", .{c});
+                        try w.print("{c}", .{c});
                     }
                 }
-                try stdout.interface.print("';\n", .{});
+                try w.print("';\n", .{});
             } else {
-                try stdout.interface.print("unset {s};\n", .{entry.key});
+                try w.print("unset {s};\n", .{entry.key});
             }
         }
     } else {
-        try stdout.interface.print("{s}", .{payload});
+        try w.print("{s}", .{payload});
     }
-    try stdout.interface.flush();
+    try w.flush();
 }
 
-fn labelSet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, labels: []const u8) !void {
+fn envGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8, shell_mode: bool) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    // Diagnosed errors were already written to stderr by envGetInto;
+    // exiting here preserves the CLI's previous exit code.
+    envGetInto(alloc, io, cfg, session_name, single_kv, shell_mode, &stdout.interface) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => std.process.exit(1),
+    };
+}
+
+/// Sets labels on a session. Labels must be non-empty key=value pairs
+/// separated by spaces. Diagnostics (validation, IPC failures) are written
+/// to process stderr, then the error is returned -- no exiting.
+/// Used by the `set` CLI command and by library consumers via libs/mux.
+pub fn labelSetInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, labels: []const u8) !void {
     std.log.info("label set session={s}", .{session_name});
 
-    assertLabels(io, labels);
+    if (!validateLabels(io, labels)) return error.InvalidLabels;
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.reportSessionNameTooLong(io, session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
 
     _ = ipc.roundTripForTag(alloc, socket_path, .LabelSet, labels, .Ack) catch |err| {
-        printLabelError(io, session_name, err);
+        reportLabelError(io, session_name, err);
+        return err;
     };
 }
 
-fn labelClear(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8) !void {
+fn labelSetCli(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, labels: []const u8) !void {
+    // Diagnosed errors were already written to stderr by labelSetInto;
+    // exiting here preserves the CLI's previous exit code.
+    labelSetInto(alloc, io, cfg, session_name, labels) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => std.process.exit(1),
+    };
+}
+
+/// Clears all labels on a session. Diagnostics are written to process
+/// stderr, then the error is returned -- no exiting.
+pub fn labelClearInto(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8) !void {
     std.log.info("label clear session={s}", .{session_name});
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.reportSessionNameTooLong(io, session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
 
     _ = ipc.roundTripForTag(alloc, socket_path, .LabelClear, "", .Ack) catch |err| {
-        printLabelError(io, session_name, err);
+        reportLabelError(io, session_name, err);
+        return err;
+    };
+}
+
+fn labelClearCli(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8) !void {
+    labelClearInto(alloc, io, cfg, session_name) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => std.process.exit(1),
     };
 }
 
 /// Fetch terminal history from a session socket, returning it as an allocated
 /// string. Caller owns the returned memory and must free it.
-fn fetchHistory(
+/// Used by `wait` (plain format) and by library consumers via libs/mux.
+pub fn fetchHistoryAlloc(
     alloc: std.mem.Allocator,
     io: std.Io,
     cfg: *Cfg,
     session_name: []const u8,
+    format: util.HistoryFormat,
 ) ![]const u8 {
     std.log.info("fetch history session={s}", .{session_name});
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
@@ -1403,8 +1538,7 @@ fn fetchHistory(
     };
     defer lib_posix.close(fd);
 
-    const format_byte: u8 = @intFromEnum(util.HistoryFormat.plain);
-    const payload = [_]u8{format_byte};
+    const payload = [_]u8{@intFromEnum(format)};
     ipc.send(fd, .History, &payload) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return error.SessionUnresponsive,
         else => return err,
@@ -1435,6 +1569,15 @@ fn fetchHistory(
     }
 
     return error.NoHistoryResponse;
+}
+
+fn fetchHistory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    session_name: []const u8,
+) ![]const u8 {
+    return fetchHistoryAlloc(alloc, io, cfg, session_name, .plain);
 }
 
 fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
@@ -1583,7 +1726,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, env_str: []const 
     // supervisor from leaving an unlabelled session behind if it dies in
     // between the two calls.
     if (labels) |kvs| {
-        try labelSet(gpa, io, daemon.cfg, daemon.session_name, kvs);
+        try labelSetInto(gpa, io, daemon.cfg, daemon.session_name, kvs);
     }
 
     const client_sock = socket.sessionConnect(daemon.socket_path) catch |err| {
@@ -1759,9 +1902,44 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
     return error.NoAckReceived;
 }
 
-fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {
+/// Sends `text` to a session: `.Send` writes to the session PTY input,
+/// `.Output` injects text into the session display. The caller owns the
+/// text bytes -- this never reads stdin and never exits.
+/// Used by the `send`/`print` CLI commands and by library consumers
+/// via libs/mux.
+pub fn sendCmd(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text: []const u8, tag: ipc.Tag) !void {
     std.log.info("send session={s}", .{session_name});
 
+    if (text.len == 0) return error.EmptyText;
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+    defer dir.close(io);
+
+    const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        var errbuf: [4096]u8 = undefined;
+        var ew = std.Io.File.stderr().writer(io, &errbuf);
+        if (err == error.ConnectionRefused) {
+            socket.cleanupStaleSocket(io, dir, session_name);
+            ew.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
+        } else {
+            ew.interface.print(
+                "session {s} is unresponsive ({s})\ndaemon may be busy: try again\n",
+                .{ session_name, @errorName(err) },
+            ) catch {};
+        }
+        ew.interface.flush() catch {};
+        return error.SessionUnresponsive;
+    };
+    defer probe_result.deinit();
+
+    ipc.send(probe_result.fd, tag, text) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return,
+        else => return err,
+    };
+}
+
+fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(alloc);
 
@@ -1792,33 +1970,8 @@ fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
         }
     }
 
-    if (payload.items.len == 0) {
-        return printError(io, "text argument required (or pipe input via stdin)", .{});
-    }
-
-    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
-    defer dir.close(io);
-
-    const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
-        std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        var errbuf: [4096]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(io, &errbuf);
-        if (err == error.ConnectionRefused) {
-            socket.cleanupStaleSocket(io, dir, session_name);
-            ew.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
-        } else {
-            ew.interface.print(
-                "session {s} is unresponsive ({s})\ndaemon may be busy: try again\n",
-                .{ session_name, @errorName(err) },
-            ) catch {};
-        }
-        ew.interface.flush() catch {};
-        return error.SessionUnresponsive;
-    };
-    defer probe_result.deinit();
-
-    ipc.send(probe_result.fd, tag, payload.items) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.BrokenPipe => return,
+    sendCmd(alloc, io, cfg, session_name, socket_path, payload.items, tag) catch |err| switch (err) {
+        error.EmptyText => return printError(io, "text argument required (or pipe input via stdin)", .{}),
         else => return err,
     };
 }

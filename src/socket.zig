@@ -137,7 +137,10 @@ pub fn getSocketPath(
     return fname;
 }
 
-pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) noreturn {
+/// Writes the "session name too long" diagnostic to stderr without exiting.
+/// Library consumers use this via the *Into command functions; the CLI
+/// wrapper adds the exit.
+pub fn reportSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) void {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
     if (maxSessionNameLen(socket_dir)) |max_len| {
@@ -152,6 +155,10 @@ pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir:
         ) catch {};
     }
     w.interface.flush() catch {};
+}
+
+pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) noreturn {
+    reportSessionNameTooLong(io, session_name, socket_dir);
     std.process.exit(1);
 }
 
