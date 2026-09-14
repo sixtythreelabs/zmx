@@ -1915,6 +1915,11 @@ pub fn sendCmd(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
 
+    // Distinguish "no such session" from "daemon busy" up front, matching
+    // the history/kill paths.
+    const exists = try socket.sessionExists(io, dir, session_name);
+    if (!exists) return error.SessionNotFound;
+
     const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         var errbuf: [4096]u8 = undefined;
