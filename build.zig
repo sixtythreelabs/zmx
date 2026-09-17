@@ -46,18 +46,6 @@ pub fn build(b: *std.Build) void {
         dep.module("ghostty-vt"),
     );
 
-    // Named module for consumers that want zmx as a library.
-    // Mirrors exe_mod's imports so `@import("build_options")` and
-    // `@import("ghostty-vt")` resolve the same way for library builds.
-    const zmx_mod = b.addModule("zmx", .{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    zmx_mod.addOptions("build_options", options);
-    zmx_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-
     // Run
     {
         const run_step = b.step("run", "Run the app");
